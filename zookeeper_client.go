@@ -25,6 +25,9 @@ type ZooKeeperOffsetClient struct {
 	zkOffsetTicker 		*time.Ticker
 }
 
+// Monitor offsets stored inside ZK by Kafka High-Level Consumer.
+// The offsets are organized in following structure (from https://cwiki.apache.org/confluence/display/KAFKA/Kafka+data+structures+in+Zookeeper)
+//   /consumers/[groupId]/offsets/[topic]/[partitionId] -> long (offset)
 func NewZooKeeperOffsetClient(app *ApplicationContext, cluster string) (*ZooKeeperOffsetClient, error) {
 	zkhosts := make([]string, len(app.Config.Kafka[cluster].Zookeepers))
 	for i, host := range app.Config.Kafka[cluster].Zookeepers {
