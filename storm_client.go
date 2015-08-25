@@ -74,6 +74,38 @@ func NewStormOffsetClient(app *ApplicationContext, cluster string) (*StormOffset
 	return client, nil
 }
 
+func (stormOffsetClient *StormOffsetClient) getOffsets(paths []string) {
+
+	log.Debugf("Start to refresh Storm offsets stored in paths: %s", paths)
+	// TODO: for now, we will perform the offset refreshing sequentially to keep it simple
+	for _, path := range paths {
+
+		// note: if a node does not exist, the "exists" flag will be set to false. The err, however, will be nil
+		exists, _, err := stormOffsetClient.conn.Exists(path)
+		switch {
+		case err == nil:
+			if !exists {
+				// we don't tolerate configuration error
+				log.Errorf("Invalid Storm offset path %s in configuration.", path)
+				panic(err)
+			}
+
+			kafkaSpouts, _, err := stormOffsetClient.conn.Children(path)
+			switch {
+			case err == nil:
+				for _, kafkaSpout := range kafkaSpouts {
+					stormOffsetClient.getOffsetsForKafkaSpout(kafkaSpout, path + "/" + kafkaSpout)
+				}
+			default:
+				log.Warnf("Failed to read consumer groups in ZK path %s. Error: %v", path, err)
+			}
+
+		default:
+			panic(err)
+		}
+	}
+}
+
 func parsePartitionId(partitionStr string)(int, error) {
 	re := regexp.MustCompile(`^partition_([0-9]+)$`)
 	if parsed := re.FindStringSubmatch(partitionStr); len(parsed) == 2 {
@@ -139,38 +171,6 @@ func (stormOffsetClient *StormOffsetClient) getOffsetsForPartition(kafkaSpout st
 		}
 	default:
 		log.Warnf("Failed to read partition for partition %v in kafka spout %s in ZK path %s. Error: %v", partition, kafkaSpout, partitionPath, err)
-	}
-}
-
-func (stormOffsetClient *StormOffsetClient) getOffsets(paths []string) {
-
-	log.Infof("Start to refresh Storm offsets stored in paths: %s", paths)
-	// for now, we will perform the offset refreshing sequentially to keep it simple
-	for _, path := range paths {
-
-		// note: if a node does not exist, the "exists" flag will be set to false. The err, however, will be nil
-		exists, _, err := stormOffsetClient.conn.Exists(path)
-		switch {
-		case err == nil:
-			if !exists {
-				// we don't tolerate configuration error
-				log.Errorf("Invalid Storm offset path %s in configuration.", path)
-				panic(err)
-			}
-
-			kafkaSpouts, _, err := stormOffsetClient.conn.Children(path)
-			switch {
-			case err == nil:
-				for _, kafkaSpout := range kafkaSpouts {
-					stormOffsetClient.getOffsetsForKafkaSpout(kafkaSpout, path + "/" + kafkaSpout)
-				}
-			default:
-				log.Warnf("Failed to read consumer groups in ZK path %s. Error: %v", path, err)
-			}
-
-		default:
-			panic(err)
-		}
 	}
 }
 
