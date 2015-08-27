@@ -162,7 +162,7 @@ func (notifier *HttpNotifier) handleEvaluationResponse(result *ConsumerGroupStat
 				return
 			}
 
-			req, err := http.NewRequest("DELETE", notifier.app.Config.Httpnotifier.Url, bytesToSend)
+			req, err := http.NewRequest("POST", notifier.app.Config.Httpnotifier.Url, bytesToSend)
 			req.Header.Set("Content-Type", "application/json")
 
 			client := &http.Client{}
