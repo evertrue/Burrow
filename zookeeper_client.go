@@ -23,6 +23,7 @@ type ZooKeeperOffsetClient struct {
 	cluster            	string
 	conn    			*zk.Conn
 	zkOffsetTicker 		*time.Ticker
+	blacklistedConsumerGroups []string
 }
 
 // Monitor offsets stored inside ZK by Kafka High-Level Consumer.
@@ -56,32 +57,35 @@ func NewZooKeeperOffsetClient(app *ApplicationContext, cluster string) (*ZooKeep
 	return client, nil
 }
 
+func (zkOffsetClient *ZooKeeperOffsetClient) isConsumerGroupBlacklisted(consumerGroup string)(bool) {
+	for _, blacklisted := range zkOffsetClient.blacklistedConsumerGroups {
+		if (blacklisted == consumerGroup) {
+			return true
+		}
+	}
+	return false
+}
+
 func (zkOffsetClient *ZooKeeperOffsetClient) getOffsets(paths []string) {
+	log.Debugf("Start to refresh ZK based offsets stored in Kafka base paths: %s", paths)
 
-	log.Debugf("Start to refresh ZK based offsets stored in paths: %s", paths)
-	// TODO: for now, we will perform the offset refreshing sequentially to keep it simple
 	for _, path := range paths {
+		consumerGroupPath := path + "/consumers"
+		consumerGroups, _, err := zkOffsetClient.conn.Children(consumerGroupPath)
 
-		// note: if a node does not exist, the "exists" flag will be set to false. The err, however, will be nil
-		exists, _, err := zkOffsetClient.conn.Exists(path)
 		switch {
 		case err == nil:
-			if !exists {
-				// likely the configuration is wrong, we don't tolerate configuration error
-				log.Errorf("Invalid ZK offset path in configuration: %s", path)
-				panic(err)
+			for _, consumerGroup := range consumerGroups {
+				if (!zkOffsetClient.isConsumerGroupBlacklisted(consumerGroup)) {
+					go zkOffsetClient.getOffsetsForConsumerGroup(consumerGroup, consumerGroupPath + "/" + consumerGroup)
+				} else {
+					log.Debugf("Skip this consumer group as it is blacklisted: " + consumerGroup)
+				}
 			}
 
-			consumerGroups, _, err := zkOffsetClient.conn.Children(path)
-			switch {
-			case err == nil:
-				for _, consumerGroup := range consumerGroups {
-					zkOffsetClient.getOffsetsForConsumerGroup(consumerGroup, path + "/" + consumerGroup)
-				}
-			default:
-				// if we cannot read one of the consumers,
-				log.Warnf("Failed to read consumer groups in ZK path %s.  Error: %s", path, err)
-			}
+		case err == zk.ErrNoNode:
+			// don't tolerate mis-configuration, let's bail out
+			panic("Failed to read consumer groups in ZK path: " + consumerGroupPath)
 
 		default:
 			// if we cannot even read the top level directory to get the list of all consumer groups, let's bail out
@@ -92,21 +96,27 @@ func (zkOffsetClient *ZooKeeperOffsetClient) getOffsets(paths []string) {
 
 func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForConsumerGroup(consumerGroup string, consumerGroupPath string) {
 	topicsPath := consumerGroupPath + "/offsets"
+
 	topics, _, err := zkOffsetClient.conn.Children(topicsPath)
 	switch {
 	case err == nil:
 		for _, topic := range topics {
-			zkOffsetClient.getOffsetsForTopic(consumerGroup, topic, topicsPath + "/" + topic)
+			go zkOffsetClient.getOffsetsForTopic(consumerGroup, topic, topicsPath + "/" + topic)
 		}
-	case err ==  zk.ErrNoNode:
+
+	case err == zk.ErrNoNode:
 		// it is OK as the offsets may not be managed by ZK
-		log.Debugf("This consumer group's offset is not managed by ZK: " + consumerGroup)
+		zkOffsetClient.blacklistedConsumerGroups = append(zkOffsetClient.blacklistedConsumerGroups, consumerGroup)
+		log.Warnf("ZK path %s does not exist. Maybe this consumer group's offset is not managed by ZK, so we will blacklist it: %s",
+			topicsPath, consumerGroup)
+
 	default:
-		log.Warnf("Failed to read topics for consumer group %s in ZK path %s. Error: %s", consumerGroup, consumerGroupPath + "/offsets", err)
+		log.Warnf("Failed to read topics for consumer group %s in ZK path %s. Error: %s", consumerGroup, topicsPath, err)
 	}
 }
 
 func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForTopic(consumerGroup string, topic string, topicPath string) {
+
 	partitions, _, err := zkOffsetClient.conn.Children(topicPath)
 	switch {
 	case err == nil:
@@ -114,12 +124,14 @@ func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForTopic(consumerGroup st
 			partition, errConversion := strconv.Atoi(partitionStr)
 			switch {
 			case errConversion == nil:
-				zkOffsetClient.getOffsetForPartition(consumerGroup, topic,  partition, topicPath + "/" + partitionStr)
+				go zkOffsetClient.getOffsetForPartition(consumerGroup, topic,  partition, topicPath + "/" + partitionStr)
+
 			default:
 				log.Errorf("Something is very wrong! The partition %s for topic %s in consumer group %s in ZK path %s should be a number",
 					partitionStr, topic, consumerGroup, topicPath)
 			}
 		}
+
 	default:
 		log.Warnf("Failed to read partitions for topic %s in consumer group %s in ZK path %s. Error: %s", topic, consumerGroup, topicPath, err)
 	}
@@ -127,6 +139,7 @@ func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForTopic(consumerGroup st
 
 func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetForPartition(consumerGroup string, topic string, partition int, partitionPath string) {
 	zkNodeStat := &zk.Stat {}
+
 	offsetStr, zkNodeStat, err := zkOffsetClient.conn.Get(partitionPath)
 	switch {
 	case err == nil:
@@ -143,10 +156,12 @@ func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetForPartition(consumerGroup
 				Offset:    int64(offset),
 			}
 			timeoutSendOffset(zkOffsetClient.app.Storage.offsetChannel, partitionOffset, 1)
+
 		default:
 			log.Errorf("Something is very wrong! The offset %s for partition %s for topic %s in consumer group %s in ZK path %s should be a number",
 				offsetStr, partition, topic, consumerGroup, partitionPath)
 		}
+
 	default:
 		log.Warnf("Failed to read partition for partition %s of topic %s in consumer group %s in ZK path %s. Error: %s", partition, topic, consumerGroup, partitionPath, err)
 	}

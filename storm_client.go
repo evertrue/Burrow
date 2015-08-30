@@ -46,6 +46,23 @@ type SpoutState struct {
 	Topic 			string
 }
 
+// Monitor offsets stored inside ZK by Storm Kafka Spout.
+// Storm Kafka Spout stores offsets and other meta data in following ZK node
+//   /<SpoutConfig.zkRoot>/<SpoutConfig.id>/partition_<partitionId>
+// the zk node contains meta data, including the offset, encoded in json. Below is an example
+// {
+//    "broker": {
+//        "host": "kafka.sample.net",
+//        "port": 9092
+//    },
+//    "offset": 4285,
+//    "partition": 1,
+//    "topic": "testTopic",
+//    "topology": {
+//        "id": "fce905ff-25e0 -409e-bc3a-d855f 787d13b",
+//        "name": "Test Topology"
+//    }
+//  }
 func NewStormOffsetClient(app *ApplicationContext, cluster string) (*StormOffsetClient, error) {
 	zkhosts := make([]string, len(app.Config.Kafka[cluster].Zookeepers))
 	for i, host := range app.Config.Kafka[cluster].Zookeepers {
@@ -74,38 +91,6 @@ func NewStormOffsetClient(app *ApplicationContext, cluster string) (*StormOffset
 	return client, nil
 }
 
-func (stormOffsetClient *StormOffsetClient) getOffsets(paths []string) {
-
-	log.Debugf("Start to refresh Storm offsets stored in paths: %s", paths)
-	// TODO: for now, we will perform the offset refreshing sequentially to keep it simple
-	for _, path := range paths {
-
-		// note: if a node does not exist, the "exists" flag will be set to false. The err, however, will be nil
-		exists, _, err := stormOffsetClient.conn.Exists(path)
-		switch {
-		case err == nil:
-			if !exists {
-				// we don't tolerate configuration error
-				log.Errorf("Invalid Storm offset path %s in configuration.", path)
-				panic(err)
-			}
-
-			kafkaSpouts, _, err := stormOffsetClient.conn.Children(path)
-			switch {
-			case err == nil:
-				for _, kafkaSpout := range kafkaSpouts {
-					stormOffsetClient.getOffsetsForKafkaSpout(kafkaSpout, path + "/" + kafkaSpout)
-				}
-			default:
-				log.Warnf("Failed to read consumer groups in ZK path %s. Error: %v", path, err)
-			}
-
-		default:
-			panic(err)
-		}
-	}
-}
-
 func parsePartitionId(partitionStr string)(int, error) {
 	re := regexp.MustCompile(`^partition_([0-9]+)$`)
 	if parsed := re.FindStringSubmatch(partitionStr); len(parsed) == 2 {
@@ -125,7 +110,30 @@ func parseStormSpoutStateJson(stateStr string)(int, string, error) {
 	}
 }
 
+func (stormOffsetClient *StormOffsetClient) getOffsets(paths []string) {
+	log.Debugf("Start to refresh Storm offsets stored in paths: %s", paths)
+
+	for _, path := range paths {
+		kafkaSpouts, _, err := stormOffsetClient.conn.Children(path)
+		switch {
+		case err == nil:
+			for _, kafkaSpout := range kafkaSpouts {
+				go stormOffsetClient.getOffsetsForKafkaSpout(kafkaSpout, path + "/" + kafkaSpout)
+			}
+
+		case err == zk.ErrNoNode:
+			// don't tolerate mis-configuration, let's bail out
+			panic("Failed to fetch spouts in ZK path: " + path)
+
+		default:
+			// if we cannot even read the top level directory to get the list of all spouts, let's bail out
+			panic(err)
+		}
+	}
+}
+
 func (stormOffsetClient *StormOffsetClient) getOffsetsForKafkaSpout(kafkaSpout string, kafkaSpoutPath string) {
+
 	partition_ids, _, err := stormOffsetClient.conn.Children(kafkaSpoutPath)
 	switch {
 	case err == nil:
@@ -134,14 +142,13 @@ func (stormOffsetClient *StormOffsetClient) getOffsetsForKafkaSpout(kafkaSpout s
 			switch {
 			case errConversion == nil:
 				stormOffsetClient.getOffsetsForPartition(kafkaSpout, partition, kafkaSpoutPath + "/" + partition_id)
+
 			default:
 				log.Errorf("Something is very wrong! The partition id %s in storm spout %s in ZK path %s should be a number",
 					partition_id, kafkaSpout, kafkaSpoutPath)
 			}
 		}
-	case err ==  zk.ErrNoNode:
-		// it is OK as the offsets may not be managed by ZK
-		log.Debugf("This kafka spout's offset is not managed by ZK: " + kafkaSpout)
+
 	default:
 		log.Warnf("Failed to read partitions for kafka spout %s in ZK path %s. Error: %v", kafkaSpout, kafkaSpoutPath, err)
 	}
@@ -149,6 +156,7 @@ func (stormOffsetClient *StormOffsetClient) getOffsetsForKafkaSpout(kafkaSpout s
 
 func (stormOffsetClient *StormOffsetClient) getOffsetsForPartition(kafkaSpout string, partition int, partitionPath string) {
 	zkNodeStat := &zk.Stat {}
+
 	stateStr, zkNodeStat, err := stormOffsetClient.conn.Get(partitionPath)
 	switch {
 	case err == nil:
@@ -165,12 +173,14 @@ func (stormOffsetClient *StormOffsetClient) getOffsetsForPartition(kafkaSpout st
 				Offset:    int64(offset),
 			}
 			timeoutSendOffset(stormOffsetClient.app.Storage.offsetChannel, partitionOffset, 1)
+
 		default:
 			log.Errorf("Something is very wrong! Cannot parse state json for partition %v in storm spout %s in ZK path %s: %s. Error: %v",
 				partition, kafkaSpout, partitionPath, stateStr, errConversion)
 		}
+
 	default:
-		log.Warnf("Failed to read partition for partition %v in kafka spout %s in ZK path %s. Error: %v", partition, kafkaSpout, partitionPath, err)
+		log.Warnf("Failed to read data for partition %v in kafka spout %s in ZK path %s. Error: %v", partition, kafkaSpout, partitionPath, err)
 	}
 }
 
