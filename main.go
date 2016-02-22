@@ -17,6 +17,7 @@ import (
 	"github.com/samuel/go-zookeeper/zk"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -26,10 +27,15 @@ type KafkaCluster struct {
 	Zookeeper *ZookeeperClient
 }
 
+type StormCluster struct {
+	Storm *StormClient
+}
+
 type ApplicationContext struct {
 	Config       *BurrowConfig
 	Storage      *OffsetStorage
 	Clusters     map[string]*KafkaCluster
+	Storms       map[string]*StormCluster
 	Server       *HttpServer
 	Emailer      *Emailer
 	HttpNotifier *HttpNotifier
@@ -172,6 +178,20 @@ func burrowMain() int {
 		appContext.Clusters[cluster] = &KafkaCluster{Client: client, Zookeeper: zkconn}
 	}
 
+	// Start Storm Clients for each storm cluster
+	appContext.Storms = make(map[string]*StormCluster, len(appContext.Config.Storm))
+	for cluster, _ := range appContext.Config.Storm {
+		log.Infof("Starting Storm client for cluster %s", cluster)
+		stormClient, err := NewStormClient(appContext, cluster)
+		if err != nil {
+			log.Criticalf("Cannot start Storm client for cluster %s: %v", cluster, err)
+			return 1
+		}
+		defer stormClient.Stop()
+
+		appContext.Storms[cluster] = &StormCluster{Storm: stormClient}
+	}
+
 	// Set up the Zookeeper lock for notification
 	appContext.NotifierLock = zk.NewLock(zkconn, appContext.Config.Zookeeper.LockPath, zk.WorldACL(zk.PermAll))
 
@@ -197,6 +217,8 @@ func burrowMain() int {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	rv := burrowMain()
 	if rv != 0 {
 		fmt.Println("Burrow failed at", time.Now().Format("January 2, 2006 at 3:04pm (MST)"))
